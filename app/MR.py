@@ -2,46 +2,39 @@ from langchain_ollama import ChatOllama
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import END, START, StateGraph, MessagesState
 from langgraph.constants import Send
-from langgraph.prebuilt import ToolNode
 
 from elasticsearch import Elasticsearch
-from langchain_community.document_loaders import UnstructuredURLLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from typing import Literal, Annotated, List, TypedDict
 import operator
 import asyncio
-from uuid import uuid4
 
 
 # --- LLM Initialization ---
 llm = ChatOllama(
-    model="gemma2:latest",
+    model="llama3.1:8b",
     base_url="http://localhost:11434"
 )
 
-
 # --- Example Documents to Summarize ---
 documents = [
-    Document(page_content="Apples are red", metadata={"title": "apple_book"}),
-    Document(page_content="Blueberries are blue", metadata={"title": "blueberry_book"}),
-    Document(page_content="Bananas are yellow", metadata={"title": "banana_book"}),
+    Document(page_content="What is Python?", metadata={"title": "python_book"}),
+    # Document(page_content="Blueberries are blue", metadata={"title": "blueberry_book"}),
+    # Document(page_content="Bananas are yellow", metadata={"title": "banana_book"}),
 ]
 
 
 # --- Prompts ---
-map_template = """Write a concise summary of the following: {context}.
-    Leverage the retrieve_context tool to get more information.
-    """
+map_template = """Answer the following question: {content}"""
 reduce_template = """
-The following is a set of summaries:
+The following is a set of responses:
 {docs}
-Take these and distill it into a final, consolidated summary
+Take these and distill it into a final, consolidated result
 of the main themes.
 """
 map_prompt = ChatPromptTemplate.from_messages([("human", map_template)])
@@ -55,56 +48,54 @@ class OverallState(TypedDict):
     summaries: Annotated[list, operator.add]
     final_summary: str
 
-class SummaryState(TypedDict):
-    content: str
-    messages: Annotated[List[AIMessage], operator.add]
+# class SummaryState(TypedDict):
+#     content: str
+#     messages: Annotated[List[AIMessage], operator.add]
 
-
-# --- Elasticsearch Tool ---
-es = Elasticsearch("http://localhost:9200")
+es = Elasticsearch("http://localhost:9200", headers={"Accept": "application/vnd.elasticsearch+json; compatible-with=9"})
 INDEX_NAME = "docs_index"
 
 @tool
 def retrieve_context(query: str):
-    """Search for relevant documents in Elasticsearch."""
-    urls = [
-        "https://docs.python.org/3/tutorial/index.html",
-        "https://realpython.com/python-basics/",
-        "https://www.learnpython.org/"
-    ]
-    loader = UnstructuredURLLoader(urls=urls)
-    docs = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=50)
-    doc_splits = text_splitter.split_documents(docs)
+    """
+    Searches for relevant documents in Elasticsearch and returns a string of relevant content.
 
-    if not es.indices.exists(index=INDEX_NAME):
-        es.indices.create(index=INDEX_NAME)
+    Args:
+        query (str): The search query to use in Elasticsearch.
 
-    for doc in doc_splits:
-        es.index(index=INDEX_NAME, id=str(uuid4()), document={"content": doc.page_content})
+    Returns:
+        str: A string containing the relevant content from Elasticsearch.
+    """
 
     response = es.search(index=INDEX_NAME, query={"match": {"content": query}}, size=5)
     results = [hit["_source"]["content"] for hit in response["hits"]["hits"]]
     return "\n".join(results)
 
-
 # --- Tool Node ---
 tools = [retrieve_context]
-tool_node = ToolNode(tools)
+# tool_node = ToolNode(tools)
 model = llm.bind_tools(tools)
 
+tools_by_name = {tool.name: tool for tool in tools}
+def tool_node(state: MessagesState):
+    result = []
+    for tool_call in state["messages"][-1].tool_calls:
+        tool = tools_by_name[tool_call["name"]]
+        observation = tool.invoke(tool_call["args"])
+        result.append(ToolMessage(content=observation, tool_call_id=tool_call["id"]))
+    return {"messages": result}
+
 # --- Map: Summary Generation Node ---
-async def generate_summary(state: SummaryState):
-    human_msg = HumanMessage(content=map_template.format(context=state["content"]))
+async def generate_summary(state: MessagesState):
+    human_msg = HumanMessage(content=map_template.format(content=state["messages"]))
     response = await model.ainvoke([human_msg])
     return {
         "messages": [response],
         "summaries": [response] 
     }
 
-
 # --- Condition: Should Continue with Tool? ---
-def should_continue(state: SummaryState) -> Literal["tools", "generate_final_summary"]:
+def should_continue(state: MessagesState) -> Literal["tools", "generate_final_summary"]:
     last_message = state["messages"][-1]
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tools"
@@ -124,7 +115,7 @@ async def generate_final_summary(state: OverallState):
 # --- Mapping Function ---
 def map_summaries(state: OverallState):
     return [
-        Send("generate_summary", {"content": content, "messages": []})
+        Send("generate_summary", {"messages": content})
         for content in state["contents"]
     ]
 
@@ -140,7 +131,6 @@ graph.add_edge("tools", "generate_summary")
 graph.add_edge("generate_final_summary", END)
 
 app = graph.compile()
-
 
 # --- Execution ---
 async def run_graph():
