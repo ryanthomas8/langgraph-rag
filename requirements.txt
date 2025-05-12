@@ -3,3 +3,4 @@ langchain_ollama
 langchain_tools
 langchain_community
 elasticsearch<9
+unstructured==0.17.2
