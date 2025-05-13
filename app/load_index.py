@@ -3,13 +3,11 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from uuid import uuid4
 from elasticsearch import Elasticsearch
 
-es = Elasticsearch("http://localhost:9200", headers={"Accept": "application/vnd.elasticsearch+json; compatible-with=9"})
+es = Elasticsearch("http://localhost:9200")
 INDEX_NAME = "docs_index"
 
 urls = [
-    "https://docs.python.org/3/tutorial/index.html",
-    "https://realpython.com/python-basics/",
-    "https://www.learnpython.org/"
+    "https://en.wikipedia.org/wiki/LeBron_James"
 ]
 loader = UnstructuredURLLoader(urls=urls)
 docs = loader.load()
